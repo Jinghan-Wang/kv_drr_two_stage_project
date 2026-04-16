@@ -1,283 +1,249 @@
-import argparse
 import os
-from datetime import datetime
+import time
+import argparse
+from typing import Dict
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import SpineDataset
-from models import TwoStageNet
-from losses import SSIMLoss, GradientLoss
-from utils import AverageMeter, seed_everything, ensure_dir, save_validation_panel, write_log
+from src.data.dataset import PairedNiftiDataset
+from src.models.total_net import TotalNet
+from src.utils.io import save_nifti_2d, load_nifti_2d
+from src.utils.losses import SSIMLoss
+from src.utils.misc import set_seed, ensure_dir, load_config
 
 
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--save_dir", type=str, required=True)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--img_size", type=int, nargs=2, default=[512, 512])
-    parser.add_argument("--max_intensity", type=float, default=4095.0)
-    parser.add_argument("--base_channels", type=int, default=32)
-    parser.add_argument("--seed", type=int, default=42)
-
-    parser.add_argument("--lambda_drr_l1", type=float, default=1.0)
-    parser.add_argument("--lambda_drr_ssim", type=float, default=0.5)
-    parser.add_argument("--lambda_drr_grad", type=float, default=0.5)
-
-    parser.add_argument("--lambda_spine_l1", type=float, default=1.0)
-    parser.add_argument("--lambda_spine_ssim", type=float, default=0.5)
-    parser.add_argument("--lambda_spine_grad", type=float, default=0.5)
-
-    parser.add_argument("--detach_stage1_to_stage2", type=int, default=0,
-                        help="1: stage2 loss does not backprop to stage1; 0: full end-to-end")
-
-    parser.add_argument("--save_val_images", type=int, default=4,
-                        help="Number of validation samples to save per epoch")
-    return parser.parse_args()
+def prepare_device(device_str: str) -> torch.device:
+    if device_str == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
+def compute_losses(outputs: Dict[str, torch.Tensor],
+                   drr_gt: torch.Tensor,
+                   spine_gt: torch.Tensor,
+                   ssim_loss,
+                   cfg) -> Dict[str, torch.Tensor]:
+    fake_drr = outputs["fake_drr"]
+    pred_spine = outputs["pred_spine"]
 
-def build_dataloaders(args):
-    train_set = SpineDataset(
-        data_root=args.data_root,
-        split="train",
-        img_size=tuple(args.img_size),
-        max_intensity=args.max_intensity,
-    )
-    val_set = SpineDataset(
-        data_root=args.data_root,
-        split="val",
-        img_size=tuple(args.img_size),
-        max_intensity=args.max_intensity,
-    )
+    l1_stage1 = torch.nn.functional.l1_loss(fake_drr, drr_gt)
+    ssim_stage1 = ssim_loss(fake_drr, drr_gt)
+    loss_stage1 = cfg["train"]["lambda_stage1_l1"] * l1_stage1 + cfg["train"]["lambda_stage1_ssim"] * ssim_stage1
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=1,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    return train_loader, val_loader
+    l1_stage2 = torch.nn.functional.l1_loss(pred_spine, spine_gt)
+    ssim_stage2 = ssim_loss(pred_spine, spine_gt)
+    loss_stage2 = cfg["train"]["lambda_stage2_l1"] * l1_stage2 + cfg["train"]["lambda_stage2_ssim"] * ssim_stage2
 
-
-
-def train_one_epoch(model, loader, optimizer, l1_loss, ssim_loss, grad_loss, device, args):
-    model.train()
-
-    total_meter = AverageMeter()
-    drr_meter = AverageMeter()
-    spine_meter = AverageMeter()
-
-    pbar = tqdm(loader, desc="Train", leave=False)
-    for batch in pbar:
-        kv = batch["kv"].to(device)
-        drr_gt = batch["drr"][:, 0:1].to(device)
-        spine_gt = batch["spine"].to(device)
-
-        outputs = model(kv)
-        fake_drr = outputs["fake_drr"]
-        pred_spine = outputs["pred_spine"]
-
-        loss_drr_l1 = l1_loss(fake_drr, drr_gt)
-        loss_drr_ssim = ssim_loss(fake_drr, drr_gt)
-        loss_drr_grad = grad_loss(fake_drr, drr_gt)
-        loss_drr = (
-            args.lambda_drr_l1 * loss_drr_l1
-            + args.lambda_drr_ssim * loss_drr_ssim
-            + args.lambda_drr_grad * loss_drr_grad
-        )
-
-        loss_spine_l1 = l1_loss(pred_spine, spine_gt)
-        loss_spine_ssim = ssim_loss(pred_spine, spine_gt)
-        loss_spine_grad = grad_loss(pred_spine, spine_gt)
-        loss_spine = (
-            args.lambda_spine_l1 * loss_spine_l1
-            + args.lambda_spine_ssim * loss_spine_ssim
-            + args.lambda_spine_grad * loss_spine_grad
-        )
-
-        loss = loss_drr + loss_spine
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        bs = kv.size(0)
-        total_meter.update(loss.item(), bs)
-        drr_meter.update(loss_drr.item(), bs)
-        spine_meter.update(loss_spine.item(), bs)
-
-        pbar.set_postfix({
-            "loss": f"{total_meter.avg:.4f}",
-            "drr": f"{drr_meter.avg:.4f}",
-            "spine": f"{spine_meter.avg:.4f}",
-        })
-
-    return total_meter.avg, drr_meter.avg, spine_meter.avg
+    total = loss_stage1 + loss_stage2
+    return {
+        "loss_stage1": loss_stage1,
+        "loss_stage2": loss_stage2,
+        "l1_stage1": l1_stage1,
+        "ssim_stage1": ssim_stage1,
+        "l1_stage2": l1_stage2,
+        "ssim_stage2": ssim_stage2,
+        "total": total,
+    }
 
 
 @torch.no_grad()
-def validate(model, loader, l1_loss, ssim_loss, grad_loss, device, args, save_dir, epoch):
+def validate(model, loader, device, cfg, ssim_loss, out_dir, epoch):
     model.eval()
+    val_dir = os.path.join(out_dir, f"val_epoch_{epoch:03d}")
+    if (epoch % cfg["val"]["save_every"]) == 0:
+        ensure_dir(val_dir)
 
-    total_meter = AverageMeter()
-    drr_meter = AverageMeter()
-    spine_meter = AverageMeter()
+    total_loss = 0.0
+    total_stage1 = 0.0
+    total_stage2 = 0.0
+    save_count = 0
 
-    vis_dir = os.path.join(save_dir, "val_images", f"epoch_{epoch:04d}")
-    ensure_dir(vis_dir)
+    for batch in tqdm(loader, desc=f"Validate {epoch}", leave=False):
+        kv_4ch = batch["kv_4ch"].to(device)
+        drr = batch["drr"].to(device)
+        spine = batch["spine"].to(device)
 
-    pbar = tqdm(loader, desc="Val", leave=False)
-    for i, batch in enumerate(pbar):
-        kv = batch["kv"].to(device)
-        drr_gt = batch["drr"][:, 0:1].to(device)
-        spine_gt = batch["spine"].to(device)
-        name = batch["name"][0]
+        outputs = model(kv_4ch)
+        losses = compute_losses(outputs, drr, spine, ssim_loss, cfg)
 
-        outputs = model(kv)
-        fake_drr = outputs["fake_drr"]
-        pred_spine = outputs["pred_spine"]
+        total_loss += losses["total"].item()
+        total_stage1 += losses["loss_stage1"].item()
+        total_stage2 += losses["loss_stage2"].item()
 
-        loss_drr_l1 = l1_loss(fake_drr, drr_gt)
-        loss_drr_ssim = ssim_loss(fake_drr, drr_gt)
-        loss_drr_grad = grad_loss(fake_drr, drr_gt)
-        loss_drr = (
-            args.lambda_drr_l1 * loss_drr_l1
-            + args.lambda_drr_ssim * loss_drr_ssim
-            + args.lambda_drr_grad * loss_drr_grad
-        )
+        if (epoch % cfg["val"]["save_every"]) == 0 and save_count < cfg["val"]["max_save_cases"]:
+            for b in range(kv_4ch.size(0)):
+                if save_count >= cfg["val"]["max_save_cases"]:
+                    break
 
-        loss_spine_l1 = l1_loss(pred_spine, spine_gt)
-        loss_spine_ssim = ssim_loss(pred_spine, spine_gt)
-        loss_spine_grad = grad_loss(pred_spine, spine_gt)
-        loss_spine = (
-            args.lambda_spine_l1 * loss_spine_l1
-            + args.lambda_spine_ssim * loss_spine_ssim
-            + args.lambda_spine_grad * loss_spine_grad
-        )
+                kv_path = batch["kv_path"][b]
+                drr_path = batch["drr_path"][b]
+                spine_path = batch["spine_path"][b]
+                kv_img, affine, header = load_nifti_2d(kv_path)
+                drr_img, _, _ = load_nifti_2d(drr_path)
+                spine_img, _, _ = load_nifti_2d(spine_path)
 
-        loss = loss_drr + loss_spine
+                scale = cfg["data"]["intensity_scale"]
+                fake_drr_np = outputs["fake_drr"][b, 0].detach().cpu().numpy() * scale
+                pred_spine_np = outputs["pred_spine"][b, 0].detach().cpu().numpy() * scale
 
-        bs = kv.size(0)
-        total_meter.update(loss.item(), bs)
-        drr_meter.update(loss_drr.item(), bs)
-        spine_meter.update(loss_spine.item(), bs)
+                base = os.path.splitext(os.path.basename(kv_path))[0].replace(".nii", "")
+                save_nifti_2d(fake_drr_np, affine, header, os.path.join(val_dir, f"{base}_fake_drr.nii.gz"))
+                save_nifti_2d(pred_spine_np, affine, header, os.path.join(val_dir, f"{base}_pred_spine.nii.gz"))
 
-        pbar.set_postfix({
-            "loss": f"{total_meter.avg:.4f}",
-            "drr": f"{drr_meter.avg:.4f}",
-            "spine": f"{spine_meter.avg:.4f}",
-        })
+                if cfg["val"]["save_inputs"]:
+                    save_nifti_2d(kv_img, affine, header, os.path.join(val_dir, f"{base}_kv.nii.gz"))
+                    save_nifti_2d(drr_img, affine, header, os.path.join(val_dir, f"{base}_drr.nii.gz"))
+                    save_nifti_2d(spine_img, affine, header, os.path.join(val_dir, f"{base}_spine.nii.gz"))
 
-        if i < args.save_val_images:
-            # 只保存原始第一通道的 KV
-            save_path = os.path.join(vis_dir, f"{name}.png")
-            save_validation_panel(
-                save_path=save_path,
-                kv=kv[0, 0:1],
-                drr_gt=drr_gt[0],
-                drr_pred=fake_drr[0],
-                spine_gt=spine_gt[0],
-                spine_pred=pred_spine[0],
-            )
+                save_count += 1
 
-    return total_meter.avg, drr_meter.avg, spine_meter.avg
-
+    n = max(1, len(loader))
+    return {
+        "val_total_loss": total_loss / n,
+        "val_stage1_loss": total_stage1 / n,
+        "val_stage2_loss": total_stage2 / n,
+    }
 
 
 def main():
-    args = parse_args()
-    seed_everything(args.seed)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cfg = load_config(args.config)
+    set_seed(cfg["seed"])
 
-    ensure_dir(args.save_dir)
-    ckpt_dir = os.path.join(args.save_dir, "checkpoints")
+    device = prepare_device(cfg["train"]["device"])
+    output_dir = os.path.join(cfg["output"]["root"], cfg["experiment_name"])
+    ckpt_dir = os.path.join(output_dir, "checkpoints")
+    ensure_dir(output_dir)
     ensure_dir(ckpt_dir)
 
-    log_path = os.path.join(args.save_dir, "train_log.txt")
-    write_log(log_path, f"Start: {datetime.now()}")
-    write_log(log_path, str(args))
+    log_path = os.path.join(output_dir, "train.log")
+    with open(log_path, "a", encoding="utf-8") as logf:
+        logf.write(f"Start training at {time.ctime()}\n")
+        logf.write(f"Config: {cfg}\n")
 
-    train_loader, val_loader = build_dataloaders(args)
-
-    model = TwoStageNet(
-        max_intensity=args.max_intensity,
-        detach_stage1_to_stage2=bool(args.detach_stage1_to_stage2),
-        base_channels=args.base_channels,
-    ).to(device)
-
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    train_ds = PairedNiftiDataset(
+        csv_file=cfg["data"]["train_csv"],
+        intensity_scale=cfg["data"]["intensity_scale"],
+        kv_thresholds=cfg["data"]["kv_thresholds"],
+        drr_thresholds=cfg["data"]["drr_thresholds"],
+    )
+    val_ds = PairedNiftiDataset(
+        csv_file=cfg["data"]["val_csv"],
+        intensity_scale=cfg["data"]["intensity_scale"],
+        kv_thresholds=cfg["data"]["kv_thresholds"],
+        drr_thresholds=cfg["data"]["drr_thresholds"],
     )
 
-    l1_loss = torch.nn.L1Loss()
-    ssim_loss = SSIMLoss(channel=1).to(device)
-    grad_loss = GradientLoss().to(device)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["data"]["num_workers"],
+        pin_memory=cfg["data"]["pin_memory"],
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=cfg["data"]["num_workers"],
+        pin_memory=cfg["data"]["pin_memory"],
+    )
 
-    best_val = float("inf")
+    kv_thresholds_scaled = [t / cfg["data"]["intensity_scale"] for t in cfg["data"]["kv_thresholds"]]
+    drr_thresholds_scaled = [t / cfg["data"]["intensity_scale"] for t in cfg["data"]["drr_thresholds"]]
 
-    for epoch in range(1, args.epochs + 1):
-        train_total, train_drr, train_spine = train_one_epoch(
-            model, train_loader, optimizer,
-            l1_loss, ssim_loss, grad_loss,
-            device, args,
-        )
+    model = TotalNet(
+        kv_thresholds=kv_thresholds_scaled,
+        drr_thresholds=drr_thresholds_scaled,
+        base_channels=cfg["model"]["base_channels"],
+        norm=cfg["model"]["norm"],
+        act=cfg["model"]["act"],
+        detach_stage1_to_stage2=cfg["train"]["detach_stage1_to_stage2"],
+    ).to(device)
 
-        val_total, val_drr, val_spine = validate(
-            model, val_loader,
-            l1_loss, ssim_loss, grad_loss,
-            device, args,
-            args.save_dir, epoch,
-        )
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
+    ssim_loss = SSIMLoss()
 
-        log_line = (
-            f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
-            f"train_total={train_total:.6f}, train_drr={train_drr:.6f}, train_spine={train_spine:.6f} | "
-            f"val_total={val_total:.6f}, val_drr={val_drr:.6f}, val_spine={val_spine:.6f}"
-        )
-        print(log_line)
-        write_log(log_path, log_line)
+    best_metric = float("inf")
+    best_name = cfg["train"]["save_best_by"]
 
-        latest_path = os.path.join(ckpt_dir, "latest.pth")
-        torch.save({
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "args": vars(args),
-            "best_val": best_val,
-        }, latest_path)
+    for epoch in range(1, cfg["train"]["epochs"] + 1):
+        model.train()
+        running_total = 0.0
+        running_stage1 = 0.0
+        running_stage2 = 0.0
 
-        if val_total < best_val:
-            best_val = val_total
-            best_path = os.path.join(ckpt_dir, "best.pth")
-            torch.save({
+        pbar = tqdm(enumerate(train_loader, start=1), total=len(train_loader), desc=f"Train {epoch}")
+        for step, batch in pbar:
+            kv_4ch = batch["kv_4ch"].to(device)
+            drr = batch["drr"].to(device)
+            spine = batch["spine"].to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(kv_4ch)
+            losses = compute_losses(outputs, drr, spine, ssim_loss, cfg)
+            losses["total"].backward()
+            optimizer.step()
+
+            running_total += losses["total"].item()
+            running_stage1 += losses["loss_stage1"].item()
+            running_stage2 += losses["loss_stage2"].item()
+
+            if step % cfg["train"]["print_freq"] == 0 or step == len(train_loader):
+                msg = (
+                    f"Epoch [{epoch}/{cfg['train']['epochs']}] Step [{step}/{len(train_loader)}] "
+                    f"total={losses['total'].item():.6f} "
+                    f"stage1={losses['loss_stage1'].item():.6f} "
+                    f"(L1={losses['l1_stage1'].item():.6f}, SSIM={losses['ssim_stage1'].item():.6f}) "
+                    f"stage2={losses['loss_stage2'].item():.6f} "
+                    f"(L1={losses['l1_stage2'].item():.6f}, SSIM={losses['ssim_stage2'].item():.6f})"
+                )
+                pbar.set_postfix_str(msg)
+                print(msg)
+                with open(log_path, "a", encoding="utf-8") as logf:
+                    logf.write(msg + "\n")
+
+        train_total = running_total / max(1, len(train_loader))
+        train_stage1 = running_stage1 / max(1, len(train_loader))
+        train_stage2 = running_stage2 / max(1, len(train_loader))
+
+        summary = f"Epoch {epoch} TRAIN: total={train_total:.6f}, stage1={train_stage1:.6f}, stage2={train_stage2:.6f}"
+        print(summary)
+        with open(log_path, "a", encoding="utf-8") as logf:
+            logf.write(summary + "\n")
+
+        if epoch % cfg["val"]["run_every"] == 0:
+            val_metrics = validate(model, val_loader, device, cfg, ssim_loss, output_dir, epoch)
+            val_summary = (
+                f"Epoch {epoch} VAL: total={val_metrics['val_total_loss']:.6f}, "
+                f"stage1={val_metrics['val_stage1_loss']:.6f}, stage2={val_metrics['val_stage2_loss']:.6f}"
+            )
+            print(val_summary)
+            with open(log_path, "a", encoding="utf-8") as logf:
+                logf.write(val_summary + "\n")
+
+            metric = val_metrics[best_name]
+            state = {
                 "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "args": vars(args),
-                "best_val": best_val,
-            }, best_path)
-            write_log(log_path, f"Saved best checkpoint at epoch {epoch}, val_total={val_total:.6f}")
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "config": cfg,
+                **val_metrics,
+            }
+            torch.save(state, os.path.join(ckpt_dir, "last.pt"))
+            if metric < best_metric:
+                best_metric = metric
+                torch.save(state, os.path.join(ckpt_dir, "best.pt"))
+                with open(log_path, "a", encoding="utf-8") as logf:
+                    logf.write(f"Saved best checkpoint at epoch {epoch}, {best_name}={metric:.6f}\n")
 
-    write_log(log_path, f"End: {datetime.now()}")
+    print("Training completed.")
 
 
 if __name__ == "__main__":
     main()
-

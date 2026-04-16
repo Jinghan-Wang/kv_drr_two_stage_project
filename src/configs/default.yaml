@@ -1,0 +1,42 @@
+experiment_name: kv_drr_spine_totalnet
+seed: 42
+
+data:
+  train_csv: /path/to/train.csv
+  val_csv: /path/to/val.csv
+  intensity_scale: 4095.0
+  kv_thresholds: [2000.0, 3000.0, 4000.0]
+  drr_thresholds: [1000.0, 2000.0, 3000.0]
+  num_workers: 4
+  pin_memory: true
+
+model:
+  base_channels: 32
+  norm: batch
+  act: relu
+
+train:
+  device: cuda
+  batch_size: 4
+  epochs: 100
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  detach_stage1_to_stage2: true
+
+  # Loss weights
+  lambda_stage1_l1: 1.0
+  lambda_stage1_ssim: 0.5
+  lambda_stage2_l1: 1.0
+  lambda_stage2_ssim: 0.5
+
+  print_freq: 10
+  save_best_by: val_total_loss
+
+val:
+  run_every: 1
+  save_every: 1
+  save_inputs: true
+  max_save_cases: 10
+
+output:
+  root: ./outputs

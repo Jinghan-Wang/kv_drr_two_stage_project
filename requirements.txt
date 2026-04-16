@@ -1,0 +1,6 @@
+numpy
+PyYAML
+nibabel
+tqdm
+torch
+torchvision
